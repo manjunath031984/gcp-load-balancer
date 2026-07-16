@@ -3,8 +3,13 @@
 // Project    : gcp-dev-july-2026
 // Purpose    : Plan/Apply/Destroy the GCP HTTP Load Balancer Terraform stack
 //
-// TOOLCHAIN NOTE: This pipeline assumes Terraform and the Google Cloud SDK
-// are already installed and available on the Jenkins agent's PATH.
+// TOOLCHAIN NOTE: The Jenkins agent's pre-installed Terraform/OpenSSL can be
+// old enough to fail TLS handshakes against storage.googleapis.com
+// ("remote error: tls: protocol version not supported") when reading the GCS
+// state backend. The 'Install Toolchain' stage below self-installs a current,
+// TLS 1.2/1.3-capable Terraform binary directly into the workspace (no root,
+// no external scripts, no Docker) and prepends it to PATH so every
+// subsequent `terraform` call in this pipeline uses it.
 // =============================================================================
 
 pipeline {
@@ -42,6 +47,7 @@ pipeline {
         TF_VERSION           = '1.13.0'
         TF_IN_AUTOMATION     = 'true'
         TF_INPUT             = 'false'
+        PATH                 = "${WORKSPACE}/.bin:${env.PATH}"
     }
 
     stages {
@@ -50,6 +56,46 @@ pipeline {
             steps {
                 checkout scm
                 echo "Checked out ${env.GIT_BRANCH ?: 'unknown branch'} @ ${env.GIT_COMMIT ?: 'unknown commit'}"
+            }
+        }
+
+        stage('Install Toolchain') {
+            steps {
+                sh '''
+                    set -euo pipefail
+                    mkdir -p "${WORKSPACE}/.bin"
+
+                    echo "===== Refreshing CA certificates / OpenSSL (best effort, requires root) ====="
+                    if [ "$(id -u)" = "0" ]; then
+                        apt-get update -qq
+                        apt-get install -y --no-install-recommends ca-certificates openssl curl unzip
+                        update-ca-certificates
+                    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                        sudo apt-get update -qq
+                        sudo apt-get install -y --no-install-recommends ca-certificates openssl curl unzip
+                        sudo update-ca-certificates
+                    else
+                        echo "WARNING: no root/sudo access on this agent - skipping OS package refresh."
+                        echo "         Terraform itself is still upgraded below, which resolves TLS"
+                        echo "         handshake failures caused by an outdated Go-compiled binary."
+                    fi
+
+                    echo "===== Installing Terraform ${TF_VERSION} (self-contained, no root required) ====="
+                    if [ -x "${WORKSPACE}/.bin/terraform" ] && "${WORKSPACE}/.bin/terraform" version | grep -q "${TF_VERSION}"; then
+                        echo "Terraform ${TF_VERSION} already installed at ${WORKSPACE}/.bin/terraform."
+                    else
+                        curl -fsSL -o /tmp/terraform.zip \
+                            "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+                        unzip -o -q /tmp/terraform.zip -d "${WORKSPACE}/.bin"
+                        chmod +x "${WORKSPACE}/.bin/terraform"
+                        rm -f /tmp/terraform.zip
+                    fi
+
+                    echo "===== Verifying TLS 1.2/1.3 connectivity to the GCS backend ====="
+                    "${WORKSPACE}/.bin/terraform" version
+                    openssl version
+                    curl -sSf -o /dev/null -w "storage.googleapis.com -> HTTP %{http_code}, TLS %{tls_version}\n" https://storage.googleapis.com/
+                '''
             }
         }
 
