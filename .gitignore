@@ -7,13 +7,19 @@ crash.log
 crash.*.log
 *.tfvars
 *.tfvars.json
-terraform.tfvars
 override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
 .terraformrc
 terraform.rc
+
+# NOTE: *.tfvars is ignored above by default (tfvars commonly hold secrets),
+# but this repo's tracked tfvars files contain no secrets (only project id,
+# region, network sizing, etc.) and are required by the Jenkins pipeline's
+# `terraform plan/apply -var-file=...`, so they are explicitly un-ignored:
+!terraform.tfvars
+!environments/**/*.tfvars
 
 # Keys / certificates
 *.pem
