@@ -44,6 +44,17 @@ variable "activate_apis" {
   ]
 }
 
+variable "manage_apis" {
+  description = <<-EOT
+    Whether Terraform should enable/disable the APIs in var.activate_apis.
+    Set to false if the deploying service account lacks
+    serviceusage.services.enable (AUTH_PERMISSION_DENIED) and instead have a
+    project admin enable the required APIs out-of-band. Defaults to true.
+  EOT
+  type        = bool
+  default     = true
+}
+
 # --- Network -----------------------------------------------------------------
 
 variable "network_name" {

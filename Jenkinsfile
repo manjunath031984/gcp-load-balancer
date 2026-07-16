@@ -145,7 +145,10 @@ pipeline {
             steps {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
                     dir(params.TF_WORKING_DIR) {
-                        sh 'terraform apply -no-color -input=false -auto-approve tfplan.out | tee tfapply.log'
+                        sh '''
+                            set -euo pipefail
+                            terraform apply -no-color -input=false -auto-approve tfplan.out | tee tfapply.log
+                        '''
                     }
                 }
             }
@@ -182,8 +185,15 @@ pipeline {
         }
 
         stage('Display Terraform Outputs') {
+            // Only reached when Terraform Apply exited 0 - declarative pipeline
+            // aborts subsequent stages as soon as any step throws, and the
+            // pipefail fix above guarantees a failed `terraform apply` throws.
+            // The explicit currentResult check is a defense-in-depth guard.
             when {
-                expression { return params.ACTION == 'apply' }
+                allOf {
+                    expression { return params.ACTION == 'apply' }
+                    expression { return currentBuild.currentResult == 'SUCCESS' }
+                }
             }
             steps {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
@@ -223,7 +233,12 @@ pipeline {
             echo "Pipeline completed successfully for project ${env.GOOGLE_CLOUD_PROJECT}."
         }
         failure {
-            echo "Pipeline failed. Review the archived logs for details."
+            // Belt-and-suspenders: guarantee the build is marked FAILURE (not
+            // left as UNSTABLE/SUCCESS) whenever any Terraform stage errors.
+            script {
+                currentBuild.result = 'FAILURE'
+            }
+            echo "Pipeline FAILED for project ${env.GOOGLE_CLOUD_PROJECT}. Review the archived tf*.log artifacts for the root cause."
         }
         cleanup {
             cleanWs(deleteDirs: true, notFailBuild: true)

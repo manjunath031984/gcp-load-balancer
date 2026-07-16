@@ -7,6 +7,7 @@ module "apis" {
 
   project_id    = var.project_id
   activate_apis = var.activate_apis
+  manage_apis   = var.manage_apis
 }
 
 module "network" {
