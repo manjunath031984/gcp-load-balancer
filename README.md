@@ -42,6 +42,7 @@ Custom VPC / Subnet (Private Google Access + Flow Logs)
 | Machine Type | `e2-micro` |
 | Boot Disk | `10 GB pd-balanced` |
 | MIG Size | `2` (fixed, no autoscaling) |
+| MIG Zones | `us-central1-a`, `us-central1-b` (fixed via `distribution_policy_zones`) |
 
 ## Project Structure
 
@@ -70,13 +71,14 @@ Custom VPC / Subnet (Private Google Access + Flow Logs)
     ├── firewall/                 # HTTP, HTTPS, SSH, Internal, Health Check rules
     ├── instance-template/        # Compute instance template
     ├── mig/                      # Regional Managed Instance Group + auto-healing
-    └── lb/                       # Global External HTTP Load Balancer
+    ├── lb/                       # Global External HTTP Load Balancer
+    └── iam-bootstrap/            # Standalone, admin-run IAM grant for the deployer SA (NOT wired into main.tf)
 ```
 
 ## Modules
 
 ### `modules/apis`
-Enables required project APIs (`compute`, `iam`, `cloudresourcemanager`, `servicenetworking`, `logging`, `monitoring`, etc.) via `google_project_service`.
+Enables required project APIs (`compute`, `iam`, `cloudresourcemanager`, `servicenetworking`, `logging`, `monitoring`, etc.) via `google_project_service`. Controlled by the root `manage_apis` variable (default `true`) — set `manage_apis = false` if the deploying service account lacks `serviceusage.services.enable`/`list` and the APIs are already enabled by an admin out-of-band.
 
 ### `modules/network`
 - Custom-mode VPC (`auto_create_subnetworks = false`)
@@ -99,8 +101,13 @@ Enables required project APIs (`compute`, `iam`, `cloudresourcemanager`, `servic
 
 ### `modules/mig`
 - `google_compute_region_instance_group_manager` with **fixed `target_size = 2`** — **no autoscaler resource is created**
+- Pinned to a fixed set of zones via `distribution_policy_zones` (default `us-central1-a`, `us-central1-b`)
+- `update_policy.max_surge_fixed` is derived from `length(distribution_policy_zones)` (with `max_unavailable_fixed = 0`), which is required because GCP rejects percent-based maxSurge/maxUnavailable for regional MIGs with `target_size < 10`, and fixed values must equal `0` or at least the number of zones the MIG spans
 - Dedicated auto-healing `google_compute_health_check` (HTTP) with configurable initial delay
 - Named port `http:80` for load balancer backend attachment
+
+### `modules/iam-bootstrap`
+Standalone Terraform root (separate state, **not** wired into the root `main.tf`) that grants the deploying service account either a curated set of predefined roles or a least-privilege custom role. Must be applied manually by a project Owner/IAM Admin — the deploying SA must never be able to grant itself additional IAM permissions. See the usage instructions in [`modules/iam-bootstrap/main.tf`](modules/iam-bootstrap/main.tf).
 
 ### `modules/lb`
 Full Global External HTTP Application Load Balancer chain:
@@ -144,6 +151,10 @@ gsutil ubla set on gs://gcp-dev-july-2026-terraform-state
    ```bash
    export GOOGLE_APPLICATION_CREDENTIALS="/path/to/infra-admin-key.json"
    ```
+
+> The IAM roles above are granted by a project Owner/Admin running [`modules/iam-bootstrap`](modules/iam-bootstrap) directly (predefined roles, or a least-privilege custom role via `-var="use_custom_role=true"`) \u2014 never by the deploying service account itself, and never through the main pipeline/root module.
+>
+> If `serviceusage.services.enable`/`list` is not yet granted, set `manage_apis = false` in your `.tfvars` to skip the `modules/apis` API-enablement step until an admin enables the required APIs out-of-band.
 
 ## Usage
 
@@ -197,33 +208,34 @@ curl "$(terraform output -raw load_balancer_url)"
 
 ## Jenkins Pipeline
 
-The [`Jenkinsfile`](Jenkinsfile) implements a declarative pipeline:
+The [`Jenkinsfile`](Jenkinsfile) implements a single, self-contained declarative pipeline (no Docker, no external scripts):
 
-1. **Checkout** — pulls the repository via `checkout scm`.
-2. **Authenticate to GCP** — materializes the service account JSON from the Jenkins credential `gcp-infra-admin-sa-key` (Secret file) into `GOOGLE_APPLICATION_CREDENTIALS`.
-3. **Install Terraform** — reuses an existing Terraform binary matching `TF_VERSION`, or downloads it if missing.
-4. **Terraform Format** — `terraform fmt -recursive -check -diff` (auto-fixes if needed).
-5. **Terraform Init** — `terraform init -input=false`.
-6. **Terraform Validate** — `terraform validate`.
-7. **Terraform Plan** — generates `tfplan.out` and `tfplan.log` (skipped when `DESTROY=true`).
-8. **Manual Approval** — pipeline `input` step gates `apply`/`destroy`.
-9. **Terraform Apply** — `terraform apply -auto-approve tfplan.out`.
-10. **Terraform Destroy** — runs instead of plan/apply when the `DESTROY` parameter is checked.
-11. **Terraform Outputs** — prints all outputs after a successful apply.
-12. **Post / Always** — archives `tfplan.out`, `tfplan.log`, `tfapply.log`, `tfdestroy.log`, `tfoutputs.log`; removes the temporary service-account key; cleans the workspace.
+1. **Checkout Source Code** — pulls the repository via `checkout scm`.
+2. **Authenticate to GCP** — materializes the service account JSON from the Jenkins credential `gcp-sa-key` (Secret file) into `GOOGLE_APPLICATION_CREDENTIALS` and runs `gcloud auth activate-service-account`.
+3. **Terraform Format** — `terraform fmt -check -recursive -diff`.
+4. **Terraform Init** — `terraform init -input=false -no-color`.
+5. **Terraform Validate** — `terraform validate -no-color`.
+6. **Terraform Plan** — generates `tfplan.out`/`tfplan.log` (only when `ACTION == apply`).
+7. **Manual Approval before Apply** — pipeline `input` step gates the apply (only when `ACTION == apply`).
+8. **Terraform Apply** — `terraform apply -auto-approve tfplan.out` (piped through `set -euo pipefail` so a failed apply fails the build).
+9. **Manual Approval before Destroy** — pipeline `input` step gates the destroy (only when `ACTION == destroy`).
+10. **Terraform Destroy** — `terraform destroy -auto-approve -var-file=...` (only when `ACTION == destroy`).
+11. **Display Terraform Outputs** — prints all outputs, only reached after a successful apply.
+12. **Workspace Cleanup** — removes the local `.terraform` directory.
+13. **Post** — `always` archives `tfplan.out`, `tfplan.log`, `tfapply.log`, `tfdestroy.log`, `tfoutputs.log`; `failure` forces the build result to `FAILURE`; `cleanup` wipes the workspace.
 
 ### Required Jenkins Configuration
 
 | Item | Type | Value |
 |---|---|---|
-| Credential ID | Secret file | `gcp-infra-admin-sa-key` — JSON key for `infra-admin@gcp-dev-july-2026.iam.gserviceaccount.com` |
-| Pipeline parameter | Boolean | `DESTROY` — run `terraform destroy -auto-approve` instead of plan/apply |
+| Credential ID | Secret file | `gcp-sa-key` — JSON key for `infra-admin@gcp-dev-july-2026.iam.gserviceaccount.com` |
+| Pipeline parameter | Choice | `ACTION` — `apply` or `destroy` |
 | Pipeline parameter | String | `TF_WORKING_DIR` — defaults to `.` |
 | Pipeline parameter | String | `VAR_FILE` — defaults to `terraform.tfvars` |
 
 ### Running a Destroy
 
-Trigger the pipeline with **Build with Parameters** → check `DESTROY` → confirm the manual approval gate.
+Trigger the pipeline with **Build with Parameters** → set `ACTION` to `destroy` → confirm the manual approval gate.
 
 ## Security Notes
 
