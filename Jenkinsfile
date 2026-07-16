@@ -5,14 +5,14 @@
 // =============================================================================
 
 pipeline {
-    agent {
-        dockerfile {
-            filename 'Dockerfile'
-            dir '.'
-            // Rebuild whenever the Dockerfile changes; reuse cached layers otherwise.
-            additionalBuildArgs '--pull'
-        }
-    }
+    // NOTE ON DOCKER USAGE: This Jenkins instance does not have the "Docker
+    // Pipeline" plugin installed, so `agent { dockerfile {} }` / `agent { docker {} }`
+    // are unavailable ("Invalid agent type ... Must be one of [any, label, none]").
+    // Instead, the pipeline runs on `agent any` and explicitly builds/runs the
+    // hardened toolchain image (see Dockerfile) via plain `docker build`/`docker run`
+    // shell calls. This only requires the `docker` CLI + socket access on the
+    // Jenkins agent (e.g. /var/run/docker.sock mounted into the Jenkins container).
+    agent any
 
     options {
         timestamps()
@@ -43,12 +43,10 @@ pipeline {
         GOOGLE_CLOUD_PROJECT = 'gcp-dev-july-2026'
         REGION               = 'us-central1'
         ZONE                 = 'us-central1-a'
-        TF_VERSION           = '1.13.0'
         TF_IN_AUTOMATION     = 'true'
         TF_INPUT             = 'false'
-        // Force modern TLS negotiation; harmless on hosts that already default
-        // to it, but guards against any legacy OpenSSL config forcing TLS 1.0/1.1.
-        CURL_SSL_BACKEND     = 'openssl'
+        TOOLCHAIN_IMAGE      = "gcp-tf-agent:${env.BUILD_NUMBER}"
+        DOCKER_RUN           = 'bash scripts/docker-run.sh'
     }
 
     stages {
@@ -60,53 +58,26 @@ pipeline {
             }
         }
 
-        stage('Environment & TLS Diagnostics') {
+        stage('Build Toolchain Image') {
             steps {
                 sh '''
                     set -euo pipefail
-
-                    echo "===== OS Information ====="
-                    cat /etc/os-release
-                    uname -a
-
-                    echo "===== Tool Versions ====="
-                    terraform version
-                    openssl version -a
-                    gcloud --version
-                    curl --version | head -n1
-                    git --version
-
-                    echo "===== Proxy / Firewall Environment Variables ====="
-                    env | grep -i -E "proxy|no_proxy" || echo "No proxy variables set."
-
-                    echo "===== DNS Resolution ====="
-                    getent hosts registry.terraform.io
-                    getent hosts storage.googleapis.com
-
-                    echo "===== Basic HTTPS Connectivity ====="
-                    curl -sSf -o /dev/null -w "registry.terraform.io -> HTTP %{http_code}, TLS %{tls_version}\n" https://registry.terraform.io/
-                    curl -sSf -o /dev/null -w "storage.googleapis.com -> HTTP %{http_code}, TLS %{tls_version}\n" https://storage.googleapis.com/
-
-                    echo "===== TLS 1.2 Handshake Check ====="
-                    echo | openssl s_client -connect registry.terraform.io:443 -tls1_2 -brief 2>&1 | grep -E "Protocol|Cipher|error" || true
-                    echo | openssl s_client -connect storage.googleapis.com:443 -tls1_2 -brief 2>&1 | grep -E "Protocol|Cipher|error" || true
-
-                    echo "===== TLS 1.3 Handshake Check ====="
-                    echo | openssl s_client -connect registry.terraform.io:443 -tls1_3 -brief 2>&1 | grep -E "Protocol|Cipher|error" || true
-                    echo | openssl s_client -connect storage.googleapis.com:443 -tls1_3 -brief 2>&1 | grep -E "Protocol|Cipher|error" || true
+                    chmod +x scripts/*.sh
+                    docker build --pull -t "${TOOLCHAIN_IMAGE}" .
                 '''
+            }
+        }
+
+        stage('Environment & TLS Diagnostics') {
+            steps {
+                sh '${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "bash scripts/diagnostics.sh"'
             }
         }
 
         stage('Authenticate to GCP') {
             steps {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
-                    sh '''
-                        set -euo pipefail
-                        export GOOGLE_CLOUD_PROJECT=gcp-dev-july-2026
-                        gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
-                        gcloud config set project gcp-dev-july-2026
-                    '''
+                    sh '${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "bash scripts/gcp-auth.sh"'
                 }
             }
         }
@@ -114,13 +85,7 @@ pipeline {
         stage('Verify Authentication') {
             steps {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
-                    sh '''
-                        set -euo pipefail
-                        echo "===== Active gcloud accounts ====="
-                        gcloud auth list
-                        echo "===== Active gcloud configuration ====="
-                        gcloud config list
-                    '''
+                    sh '${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "bash scripts/gcp-verify.sh"'
                 }
             }
         }
@@ -128,7 +93,7 @@ pipeline {
         stage('Terraform Format') {
             steps {
                 dir(params.TF_WORKING_DIR) {
-                    sh 'terraform fmt -check -recursive -diff'
+                    sh '${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "terraform fmt -check -recursive -diff"'
                 }
             }
         }
@@ -137,7 +102,7 @@ pipeline {
             steps {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
                     dir(params.TF_WORKING_DIR) {
-                        sh 'terraform init -input=false -no-color'
+                        sh '${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "terraform init -input=false -no-color"'
                     }
                 }
             }
@@ -147,7 +112,7 @@ pipeline {
             steps {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
                     dir(params.TF_WORKING_DIR) {
-                        sh 'terraform validate -no-color'
+                        sh '${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "terraform validate -no-color"'
                     }
                 }
             }
@@ -161,10 +126,7 @@ pipeline {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
                     dir(params.TF_WORKING_DIR) {
                         sh """
-                            set -euo pipefail
-                            terraform plan -no-color -input=false \
-                                -var-file="${params.VAR_FILE}" \
-                                -out=tfplan.out | tee tfplan.log
+                            ${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "terraform plan -no-color -input=false -var-file=${params.VAR_FILE} -out=tfplan.out | tee tfplan.log"
                         """
                     }
                 }
@@ -191,7 +153,7 @@ pipeline {
             steps {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
                     dir(params.TF_WORKING_DIR) {
-                        sh 'terraform apply -no-color -input=false -auto-approve tfplan.out | tee tfapply.log'
+                        sh '${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "terraform apply -no-color -input=false -auto-approve tfplan.out | tee tfapply.log"'
                     }
                 }
             }
@@ -218,9 +180,7 @@ pipeline {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
                     dir(params.TF_WORKING_DIR) {
                         sh """
-                            set -euo pipefail
-                            terraform destroy -no-color -input=false -auto-approve \
-                                -var-file="${params.VAR_FILE}" | tee tfdestroy.log
+                            ${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "terraform destroy -no-color -input=false -auto-approve -var-file=${params.VAR_FILE} | tee tfdestroy.log"
                         """
                     }
                 }
@@ -234,11 +194,7 @@ pipeline {
             steps {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
                     dir(params.TF_WORKING_DIR) {
-                        sh '''
-                            set -euo pipefail
-                            echo "===== Terraform Outputs ====="
-                            terraform output -no-color | tee tfoutputs.log
-                        '''
+                        sh '${DOCKER_RUN} "${TOOLCHAIN_IMAGE}" "echo Terraform Outputs && terraform output -no-color | tee tfoutputs.log"'
                     }
                 }
             }
@@ -264,6 +220,7 @@ pipeline {
                                   allowEmptyArchive: true,
                                   fingerprint: true
             }
+            sh 'docker rmi "${TOOLCHAIN_IMAGE}" || true'
         }
         success {
             echo "Pipeline completed successfully for project ${env.GOOGLE_CLOUD_PROJECT}."
@@ -276,3 +233,4 @@ pipeline {
         }
     }
 }
+
