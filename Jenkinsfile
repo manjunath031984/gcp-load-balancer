@@ -5,7 +5,14 @@
 // =============================================================================
 
 pipeline {
-    agent any
+    agent {
+        dockerfile {
+            filename 'Dockerfile'
+            dir '.'
+            // Rebuild whenever the Dockerfile changes; reuse cached layers otherwise.
+            additionalBuildArgs '--pull'
+        }
+    }
 
     options {
         timestamps()
@@ -39,7 +46,9 @@ pipeline {
         TF_VERSION           = '1.13.0'
         TF_IN_AUTOMATION     = 'true'
         TF_INPUT             = 'false'
-        PATH                 = "${WORKSPACE}/.bin:${env.PATH}"
+        // Force modern TLS negotiation; harmless on hosts that already default
+        // to it, but guards against any legacy OpenSSL config forcing TLS 1.0/1.1.
+        CURL_SSL_BACKEND     = 'openssl'
     }
 
     stages {
@@ -51,11 +60,50 @@ pipeline {
             }
         }
 
+        stage('Environment & TLS Diagnostics') {
+            steps {
+                sh '''
+                    set -euo pipefail
+
+                    echo "===== OS Information ====="
+                    cat /etc/os-release
+                    uname -a
+
+                    echo "===== Tool Versions ====="
+                    terraform version
+                    openssl version -a
+                    gcloud --version
+                    curl --version | head -n1
+                    git --version
+
+                    echo "===== Proxy / Firewall Environment Variables ====="
+                    env | grep -i -E "proxy|no_proxy" || echo "No proxy variables set."
+
+                    echo "===== DNS Resolution ====="
+                    getent hosts registry.terraform.io
+                    getent hosts storage.googleapis.com
+
+                    echo "===== Basic HTTPS Connectivity ====="
+                    curl -sSf -o /dev/null -w "registry.terraform.io -> HTTP %{http_code}, TLS %{tls_version}\n" https://registry.terraform.io/
+                    curl -sSf -o /dev/null -w "storage.googleapis.com -> HTTP %{http_code}, TLS %{tls_version}\n" https://storage.googleapis.com/
+
+                    echo "===== TLS 1.2 Handshake Check ====="
+                    echo | openssl s_client -connect registry.terraform.io:443 -tls1_2 -brief 2>&1 | grep -E "Protocol|Cipher|error" || true
+                    echo | openssl s_client -connect storage.googleapis.com:443 -tls1_2 -brief 2>&1 | grep -E "Protocol|Cipher|error" || true
+
+                    echo "===== TLS 1.3 Handshake Check ====="
+                    echo | openssl s_client -connect registry.terraform.io:443 -tls1_3 -brief 2>&1 | grep -E "Protocol|Cipher|error" || true
+                    echo | openssl s_client -connect storage.googleapis.com:443 -tls1_3 -brief 2>&1 | grep -E "Protocol|Cipher|error" || true
+                '''
+            }
+        }
+
         stage('Authenticate to GCP') {
             steps {
                 withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
                     sh '''
                         set -euo pipefail
+                        export GOOGLE_CLOUD_PROJECT=gcp-dev-july-2026
                         gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
                         gcloud config set project gcp-dev-july-2026
                     '''
@@ -74,29 +122,6 @@ pipeline {
                         gcloud config list
                     '''
                 }
-            }
-        }
-
-        stage('Install Terraform') {
-            steps {
-                sh '''
-                    set -euo pipefail
-                    mkdir -p "${WORKSPACE}/.bin"
-
-                    if command -v terraform >/dev/null 2>&1 && terraform version | grep -q "${TF_VERSION}"; then
-                        echo "Terraform ${TF_VERSION} already available on PATH."
-                        cp "$(command -v terraform)" "${WORKSPACE}/.bin/terraform"
-                    else
-                        echo "Installing Terraform ${TF_VERSION}..."
-                        curl -sSL -o /tmp/terraform.zip \
-                            "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
-                        unzip -o /tmp/terraform.zip -d "${WORKSPACE}/.bin"
-                        chmod +x "${WORKSPACE}/.bin/terraform"
-                        rm -f /tmp/terraform.zip
-                    fi
-
-                    "${WORKSPACE}/.bin/terraform" version
-                '''
             }
         }
 
