@@ -41,11 +41,16 @@ resource "google_compute_region_instance_group_manager" "this" {
     initial_delay_sec = var.health_check_initial_delay_sec
   }
 
+  # NOTE: fixed maxSurge/maxUnavailable values for a regional MIG must be
+  # either 0 or >= the number of zones the MIG spans. Since this MIG spans
+  # all zones in the region (no distribution_policy_zones restriction) and
+  # target_size can be smaller than the zone count, percent-based values are
+  # used instead so the policy is valid regardless of zone count or size.
   update_policy {
     type                         = "PROACTIVE"
     minimal_action               = "REPLACE"
-    max_surge_fixed              = 1
-    max_unavailable_fixed        = 0
+    max_surge_percent            = 100
+    max_unavailable_percent      = 0
     instance_redistribution_type = "PROACTIVE"
   }
 }
