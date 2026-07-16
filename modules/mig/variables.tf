@@ -29,6 +29,11 @@ variable "target_size" {
   default     = 2
 }
 
+variable "distribution_policy_zones" {
+  description = "Fixed set of zones the regional MIG is pinned to. Required so that update_policy.max_surge_fixed (set equal to the zone count) satisfies the GCP API constraint that fixed maxSurge/maxUnavailable be 0 or >= the number of zones the MIG spans."
+  type        = list(string)
+}
+
 variable "named_port" {
   description = "Port exposed via the named port 'http'."
   type        = number

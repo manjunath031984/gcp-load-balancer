@@ -63,6 +63,7 @@ module "mig" {
   base_instance_name             = var.base_instance_name
   instance_template_self_link    = module.instance_template.self_link
   target_size                    = var.target_size
+  distribution_policy_zones      = var.mig_distribution_policy_zones
   named_port                     = var.lb_port
   health_check_port              = var.lb_port
   health_check_path              = "/"

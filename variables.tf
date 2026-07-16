@@ -147,6 +147,12 @@ variable "target_size" {
   default     = 2
 }
 
+variable "mig_distribution_policy_zones" {
+  description = "Fixed set of zones the regional MIG is pinned to. Must have at least one zone; update_policy.max_surge_fixed is derived from this list's length so it satisfies GCP's regional MIG constraint (fixed maxSurge/maxUnavailable must be 0 or >= zone count) without requiring target_size >= 10."
+  type        = list(string)
+  default     = ["us-central1-a", "us-central1-b"]
+}
+
 variable "base_instance_name" {
   description = "Base name used for instances created by the MIG."
   type        = string
