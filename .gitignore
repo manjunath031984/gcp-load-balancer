@@ -1,0 +1,41 @@
+# Terraform
+**/.terraform/*
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+terraform.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Keys / certificates
+*.pem
+*.key
+*.p12
+
+# Terraform plan/apply artifacts produced by Jenkins
+tfplan.out
+tfplan.log
+tfapply.log
+tfdestroy.log
+tfoutputs.log
+
+# Service account keys / credentials
+*.json
+!package.json
+.gcp/
+gcp-sa-key
+gcp-sa-key.json
+*sa-key*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
