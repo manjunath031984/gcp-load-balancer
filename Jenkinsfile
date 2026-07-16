@@ -86,6 +86,26 @@ pipeline {
                 }
             }
         }
+         stage('Registry Connectivity Check') {
+            steps {
+                sh '''
+                    set +e
+                    echo "Checking outbound access to registry.terraform.io ..."
+                    if command -v getent >/dev/null 2>&1; then
+                        getent hosts registry.terraform.io || echo "WARNING: DNS resolution failed for registry.terraform.io"
+                    fi
+                    curl -sS --max-time 10 -o /dev/null -w "registry.terraform.io -> HTTP %{http_code}\\n" https://registry.terraform.io/.well-known/terraform.json
+                    status=$?
+                    if [ $status -ne 0 ]; then
+                        echo "ERROR: Could not reach registry.terraform.io (curl exit code $status)."
+                        echo "Check agent egress/firewall rules, or set HTTPS_PROXY/HTTP_PROXY/NO_PROXY if this agent requires a proxy."
+                        exit 1
+                    fi
+                    echo "Proxy env vars: http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy"
+                '''
+            }
+        }
+
 
         stage('Terraform Init') {
             steps {
